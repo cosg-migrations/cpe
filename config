@@ -1,0 +1,43 @@
+# Config File for Pre and Post Scripts
+
+#
+# Commonly Changed Variables
+#
+	managedImage=false
+	rmmServerIp="10.105.12.13"
+	newHostname="GB3RTMMSANDBO02"
+	DNS1="172.17.1.26"
+	DNS2="172.17.1.27"
+#
+# Less Frequently Changed Variables
+#
+	dataCenter=`echo ${newHostname}|cut -c1-3`
+	#dataCenter=`expr substr ${newHostname} 0 3`
+	myFqdn=`uname -n`
+	myDomain=`echo ${myFqdn#*.}`
+	myHostname=`echo ${myFqdn%%.*}`
+	workingDir="/root/migration/"
+	bkupDir="${workingDir}RWMigration_backup"
+	postGuestLog="${workingDir}GuestPasswd.log"
+	sysAdminDir="/sysadmin"
+	rmmWebDir="windows/RWTools"
+	rmmCert="ssh-rsa AAAAB3NzaC1yc2EAAAABIwAAAQEApwIz6GKsCvQWydxsl/nI9U2JZUwwy97Ss+wgtvl0zF0bSQT/4cy19r5t84f83Wjfa278bP2NMES+kW8jvT/mwtacpFXA6C4kD7aW0FpdaWHKa2KLrLmhNTPnXK52MCFJPk8mrcdHFzcDyzK6qrvUrer7NwIh07T8YiGAVsRq88mYwftgfuYcQqqf9LwAHGLl1wK/aavyau4EkDa2lIPMEmrIOgncCFhIOQ6b2wbKUsQ8+p2sceT+3vNbnAyh3Zr+AU1ltCIZAopbG7Gb5tyd8/8KaiVOmzNm5FNux9XOOfg1Or4ua9urMh7I09IVNs9VhYBXNxX8u1kXdXL5hBy90Q== root@GB3CLCMCLRMM02.gb3.savvis.net"
+	sshConfig="/etc/ssh/sshd_config"
+	export PATH=$PATH:/sbin:/usr/local/sbin:/usr/sbin
+	centosRequirePackages="redhat-lsb libxslt bind-utils"
+	centosVMwareTools="vmware-tools-esx-nox vmware-tools-esx-kmods"
+	redhatRequirePackages="redhat-lsb libxslt bind-utils"
+	redhatVMwareTools="vmware-tools-esx-nox vmware-tools-esx-kmods"
+	ubuntuRequirePackages="binutils netcat wget rsync"
+
+	# for vpdcRHUIFix function
+	baseDir="$(dirname $0)"
+   	rpmDir="${baseDir}/rpms"
+  	vpdcOldRhuiRpm="svvs-rhua-dc2-rhel${majorVersionID}-2.3-1.noarch.rpm"
+ 	rhRepoFile="/etc/yum.repos.d/rh-cloud.repo"
+   	oldRhuiRpm="$(rpm -qf ${rhRepoFile} 2>/dev/null)"
+#
+# Decommissioned Variables
+#
+	#currentIP=`/sbin/ifconfig eth1|grep inet|cut -d ":" -f2|cut -d " " -f1`
+	#rootPWD=`head -n 1 ${postGuestLog}|cut -d "," -f 5`

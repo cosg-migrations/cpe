@@ -1,0 +1,1033 @@
+#!/bin/bash
+
+# This script configures VPDC Managed Guests for Migration to CLC/Tier3
+
+# Author: Cloud Product Engineering
+# Support: TBD
+# Version: 1.1
+
+# From steps laid out in https://confluence.savvis.net/display/CUP/RackWare+Migration+Process
+
+##-------------------------------------------------------------------
+## Exit Codes    : 0 - Successful
+##                 1 - Missing Argument(s)
+##                 2 - Missing RMM Server IP
+##                 3 - RMM Server provided is not a valid IP address
+##                 4 - Missing Data Center
+##                 5 - Missing New Hostname
+##                 6 - Missing DNS Server(s)
+##                 7 - Path to RHUI RPM is invalid
+##                 8 - Problem with file or file permissions
+##                 9 - User running the script is not root
+##                10 - Unable to determine distribution
+##                11 - Unable to determine revision
+##                12 - Arcitecture not x86_64
+##                13 - Problem obtaining IP Address
+##                14 - Required Packages cannot be determined
+##                15 - Unsupported Linux Distribution or Architecture
+##				  16 - Exit requested before reboot
+##				  17 - Error with password file: ${postGuestLog}
+##				  18 - Cannot generate working password for this revision of linux
+##				  19 - Issue with required service not installed or no init.d
+##-------------------------------------------------------------------
+
+###############################
+####       UNIVERSAL       ####
+###############################
+
+whoAmI () {
+	echo "ACTION: User Determination"
+	if [ "x`id -un`" != "xroot" ]; then
+		echo "You must be root to run this script..."
+		exit 9
+	fi
+	isRootWritable
+}
+
+isRootWritable () {
+	echo "is root writable?"
+	if [ "`stat -c "%a" /root`" != "750" ]; then
+		echo "chmod 750 /root"
+		chmod 750 /root
+	fi
+}
+
+setWorkingDirectory () {
+	echo "ACTION: Setting Working Directory"
+	if [ ! -d ${workingDir} ]; then
+		echo "mkdir working"
+		mkdir -p ${workingDir}
+	else
+		echo "INFO: System has a working directory"
+		alreadyRun=1
+	fi
+}
+
+setBackupDir () {
+	echo "ACTION: Setting Backup Directory"
+	if [ ! -d ${bkupDir} ]; then
+		echo "mkdir backup"
+		mkdir -p ${bkupDir}
+	else
+		echo "INFO: System has a backup Directory"
+		alreadyRun=2
+	fi
+}
+
+currentIP () {
+    # TODO: Determine VPDC, CDC or CLC
+    currentIP=`/sbin/ifconfig eth1|grep inet|cut -d ":" -f2|cut -d " " -f1`
+}
+
+rmmCertRead () {
+    # This was done in the sourcing of the config file
+	echo "ACTION: Reading RMM Pub Key"
+	# On RMM Server
+	#if [[ ${run} == "l=nada" ]]; then
+	#    rmmCert=`cat /root/.ssh/id_rsa.pub`
+	#fi
+	#echo $rmmCert >> config
+}
+
+distroDetect () {
+	echo "ACTION: Detecting Distribution"
+	if [ -e /etc/centos-release ] && [ ! -h /etc/centos-release ]; then
+		cp /etc/centos-release /tmp/release
+	    sed -i 's/ release /|/g' /tmp/release
+		sed -i -r 's/\(.+\)//g' /tmp/release
+		distroID=`cut -d "|" -f 1 /tmp/release |tr '[:upper:]' '[:lower:]'|cut -b 1-7`
+		distroID=`echo "${distroID//+([[:space:]])/}"`
+		revisionID=`cut -d "|" -f2 /tmp/release`
+		majorVersionID=`echo $revisionID|cut -d "." -f 1`
+		minorVersionID=`echo $revisionID|cut -d "." -f 2`
+		baseArch=`/bin/arch`
+	elif [ -e /etc/redhat-release ] && [ ! -h /etc/redhat-release ]; then
+	    cp /etc/redhat-release /tmp/release
+	    sed -i 's/ release /|/g' /tmp/release
+		sed -i -r 's/\(.+\)//g' /tmp/release
+		echo "ACTION: Forcing redhat as variable."
+		#distroID="redhat"
+		distroID=`cut -d "|" -f 1 /tmp/release |tr '[:upper:]' '[:lower:]'|cut -b 1-7`
+		distroID=`echo "${distroID}"|sed 's/ //g'|tr -d ' '`
+		revisionID=`cut -d "|" -f2 /tmp/release`
+		majorVersionID=`echo $revisionID|cut -d "." -f 1`
+		minorVersionID=`echo $revisionID|cut -d "." -f 2`
+		baseArch=`/bin/arch`
+	else
+		distroID="UNKNOWN"
+		echo "ERROR: Unknown distribution release file"
+		break
+	fi
+		if [ "x${distroID}" != "xredhat" ] || [ "x${distroID}" != "xcentos" ] || [ "x${distroID}" != "xubuntu" ]; then
+		echo "INFO: Distribution: ${distroID}"
+	else
+		echo "ERROR: Unable to determine distribution."
+		exit 10
+	fi
+
+	if [ "x${revisionID}" != "x" ]; then
+		echo "INFO: Revision: ${revisionID}"
+	else
+		echo "ERROR: Unable to determine revision"
+		exit 11
+	fi
+
+	if [ "${baseArch}" = "x86_64" ]; then
+		echo "INFO: Architecture: ${baseArch}"
+	else
+		echo "ERROR: Unsupported or indeterminet architecture. found: "${baseArch}
+		exit 12
+	fi
+}
+
+checkInstalledRwPre () {
+	echo "ACTION: Checking Installed Packages"
+	reqPkgRwPreFull=(nc-1.84-10.fc6.x86_64 iscsi-initiator-utils-6.2.0.872-16.el5.x86_64 wget-1.11.4-3.el5_8.2.x86_64 binutils-2.17.50.0.6-9.el5.x86_64 rsync-2.6.8-3.1.x86_64 net-snmp-5.3.2.2-25.el5_11.x86_64 net-snmp-utils-5.3.2.2-25.el5_11.x86_64)
+		for i in "${!reqPkgRwPreFull[@]}"; do
+			reqPkgChk+=`echo $i|sed 's/-[0-9].*//'`
+			reqPkgVer+=`echo $i|sed 's/.*[A-Za-z]-//'|sed 's/.[A-Za-z].*//'`
+		done
+	reqPkgChk=(nc iscsi-initiator-utils wget binutils rsync net-snmp net-snmp-utils)
+	if [[ "$distroID" == "centos" ]]; then
+		for i in ${!reqPkgChk[@]}; do
+			#pkgName=`rpm -q ${reqPkgChk[$i]}|sed 's/-[0-9].*//'`
+			#pkgVer=`rpm -q ${reqPkgChk[$i]}|sed 's/.*[A-Za-z]-//'|sed 's/.[A-Za-z].*//'`
+			if rpm -q ${reqPkgChk[$i]}; then
+				echo "INFO: Package "${reqPkgChk[$i]}" already installed"
+			else
+				echo ${reqPkgChk[$i]} >> ${workingDir}/package.log
+				reqPkgCentos+=(${reqPkgChk[$i]})
+			fi
+		done
+	elif [[ "$distroID" == "redhat" ]]; then
+		for i in ${!reqPkgChk[@]}; do
+			if rpm -q ${reqPkgChk[$i]}; then
+				echo "INFO: Package "${reqPkgChk[$i]}" already installed"
+			else
+				echo ${reqPkgChk[$i]} >> ${workingDir}/package.log
+				reqPkgRedHat+=(${reqPkgChk[$i]})
+			fi
+		done
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		reqPkgChk=(binutils netcat wget rsync)
+		for i in ${!reqPkgChk[@]}; do
+			if dpkg -s ${reqPkgChk[$i]}; then
+				echo "INFO: Package "${reqPkgChk[$i]}" already installed"
+			else  
+				echo "not found "${reqPkgChk[$i]}
+				reqPkgUbuntu+=(${reqPkgChk[$i]})
+				echo ${reqPkgChk[$i]} >> ${workingDir}/package.log
+			fi
+		done
+	fi
+}
+
+checkInstalledPost () {
+	echo "ACTION: Checking Installed Packages"
+	reqPkgPostFull=(libxslt-1.1.17-4.el5_8.3.x86_64 redhat-lsb-4.0-2.1.4.el5.x86_64 bind-utils-9.3.6-25.P1.el5_11.2.x86_64)
+	for i in "${!reqPkgPostFull[@]}"; do
+		reqPkgChk+=`echo $i|sed 's/-[0-9].*//'`
+		reqPkgVer+=`echo $i|sed 's/.*[A-Za-z]-//'|sed 's/.[A-Za-z].*//'`
+	done
+	reqPkgChk=(libxslt redhat-lsb bind-utils)
+	if [[ "$distroID" == "centos" ]]; then
+		for i in "${!reqPkgChk[@]}"; do
+			#pkgName=`rpm -q ${reqPkgChk[$i]}|sed 's/-[0-9].*//'`
+			#pkgVer=`rpm -q ${reqPkgChk[$i]}|sed 's/.*[A-Za-z]-//'|sed 's/.[A-Za-z].*//'`
+			if rpm -q ${reqPkgChk[$i]}; then
+				echo "found "${reqPkgChk[$i]}
+			else
+				echo "not found "${reqPkgChk[$i]}
+				reqPkgCentos+=(${reqPkgChk[$i]})
+			fi
+		done
+	elif [[ "$distroID" == "redhat" ]]; then
+		for i in "${!reqPkgChk[@]}"; do
+			if rpm -q ${reqPkgChk[$i]}; then
+				echo "found "${reqPkgChk[$i]}
+			else
+				echo "not found "${reqPkgChk[$i]}
+				reqPkgRedHat+=(${reqPkgChk[$i]})
+			fi
+		done
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		reqPkgChk=(binutils netcat wget rsync)
+		for i in "${!reqPkgChk[@]}"; do
+			if dpkg -s ${reqPkgChk[$i]}; then
+				echo "found "${reqPkgChk[$i]}
+			else
+				echo "not found "${reqPkgChk[$i]}
+				reqPkgUbuntu+=(${reqPkgChk[$i]})
+			fi
+		done
+	fi
+}
+
+installPackages () {
+	if [[ "$distroID" == "centos" ]]; then
+		if [ ${#reqPkgCentos[@]} -ne 0 ]; then
+			echo "ACTION: Installing required packages (This action may take a few moments)"
+			yum -qy install ${reqPkgCentos[*]}
+		fi
+	elif [[ "$distroID" == "redhat" ]]; then
+		if [ ${#reqPkgRedHat[@]} -ne 0 ]; then
+			echo "ACTION: Installing required packages (This action may take a few moments)"
+			yum -qy install ${reqPkgRedHat[*]}
+		fi
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		if [ ${#reqPkgUbuntu[@]} -ne 0 ]; then
+			echo "ACTION: Installing required packages (This action may take a few moments)"
+			apt-get --assume-yes remove open-iscsi
+			apt-get --assume-yes install "${reqPkgUbuntu[*]}"
+		fi
+	fi
+}
+
+verifyPackage () {
+	# Verify Require Packages are Installed
+if [[ "$distroID" == "centos" ]]; then
+	rpm -q ${centosRequirePackages}
+	if [ $? -eq 0 ]; then
+		echo "INFO: Verified that CentOS required packages are installed"
+	else
+		echo "WARNING: Unable to verify that CentOS required packages are installed.  Manually Verify"
+	fi
+elif [[ "$distroID" == "ubuntu" ]]; then
+	# Verify Required Packages are Installed
+	dpkg -l ${ubuntuRequirePackages}
+	if [ $? -eq 0 ]; then
+		echo "INFO: Verified that Ubuntu required packages are installed"
+	else
+		echo "WARNING: Unable to verify that Ubuntu required packages are installed.  Manually Verify"
+	fi
+fi
+}
+
+
+
+###############################
+####     PRE MIGRATION     ####
+###############################
+
+checkGenPasswdFile () {
+
+	# check for file; if no file; then
+	if [ ! -w ${postGuestLog} ]; then
+		genRootPasswd
+	else
+		echo "ACTION: Sourcing "${postGuestLog}
+		source ${postGuestLog}
+	fi
+
+	if [[ ${clearTextPasswd} != "" ]] && [[ ${hashedPasswd} != "" ]]; then
+		# if file and previous password and hash; then
+		echo "INFO: Found requested clear text and hashed password"
+		echo "ATTENTION: PASSWORD AND HASH WILL NOT BEING CHECKED FOR CONSISTENCY"
+	elif [[ ${clearTextPasswd} != "" ]] && [[ ${hashedPasswd} = "" ]]; then
+		#previous password exist and no hash ; then
+		genRootPasswd ${clearTextPasswd}
+		echo "ACTION: Passing requested password to hashing function"
+	# exit
+	elif [[ ${clearTextPasswd} = "" ]]; then
+		genRootPasswd
+	else
+		echo "ERROR: Unable to determine password course of action. please check file: "${postGuestLog}
+		exit 17
+	fi
+}
+
+# TODO: Squash Logging in a safe way
+genRootPasswd () {
+	# Turn off logging passwords to anything but the right file
+	if [ -z ${1} ]; then
+		echo "ACTION: Generating new root password. check "${postGuestLog}
+		export genPasswd=`LC_CTYPE="C" tr -cd 'a-zA-Z0-9!@#^%*.+-:' < /dev/urandom | head -c 12`
+	#clearTextPasswd=${genPasswd}
+	else
+		echo "ACTION: Hashing requested root password. check "${postGuestLog}
+		export genPasswd=${1}
+	fi
+
+	if [[ ${majorVersionID} == "5" ]]; then
+		# Gen Salt
+		export genSalt=`LC_CTYPE="C" tr -cd 'a-zA-Z0-9' < /dev/urandom | head -c 8`
+		# Lets make the whole shadow pass where $1$ is MD5, then the salt, then the password.
+		cryptPasswd=`python -c 'import os,crypt; print crypt.crypt(os.environ["genPasswd"], "$1$"+os.environ["genSalt"])'`
+	elif [[ ${majorVersionID} == "6" ]]; then
+		# Gen Salt
+		export genSalt=`LC_CTYPE="C" tr -cd 'a-zA-Z0-9' < /dev/urandom | head -c 16`
+		# Lets make the whole shadow pass where $6$ is SHA-512, then the salt, then the password.
+		cryptPasswd=`python -c 'import os,crypt; print crypt.crypt(os.environ["genPasswd"], "$6$"+os.environ["genSalt"])'`
+	else
+		echo "ERROR: Non-matching Revision ID for Distribution"
+		exit 18
+	fi
+
+	echo "clearTextPasswd='"${genPasswd}"'" > $postGuestLog
+	echo "passwdSalt='"${genSalt}"'" >> $postGuestLog
+	echo "hashedPasswd='"${cryptPasswd}"'" >> $postGuestLog
+}
+
+changeRootPwd () {
+	#sleep 0.5
+	echo "ACTION: Setting root password"
+	echo "INFO: If the PRE script has not been run or there is a problem with "${postGuestLog}" a new password will be generated"
+	checkGenPasswdFile
+	source ${postGuestLog}
+	# Stop logging to syslog and send to terminal of ssh user
+	#exec 1>${SSH_TTY} 2>&1
+	echo
+	echo "###########################"
+	echo "## Setting Root Password ##"
+	echo "###########################"
+	usermod -p ${hashedPasswd} root
+	echo
+	echo "+++++++++++++++++++++++++++++++++++"
+	echo "+   Root Password: "${clearTextPasswd}"   +"
+	echo "+++++++++++++++++++++++++++++++++++"
+	echo
+	echo "Document root password.  Press [Enter] key to contine."
+	read -n
+}
+
+sshKeys () {
+	echo "ACTION: Manipulating .ssh keys/folders"
+	if [ ! -d /root/.ssh ]; then
+		mkdir /root/.ssh
+		chmod 700 /root/.ssh
+	fi
+	if [ "`stat -c "%a" /root/.ssh`" != "700" ]; then
+		chmod 700 /root/.ssh
+	fi
+	# RMM Cert from Local to Remote
+	echo "ACTION: Manipulating authorized_keys"
+	echo $rmmCert >> /root/.ssh/authorized_keys
+	if [ "`stat -c "%a" /root/.ssh/authorized_keys`" != "600" ]; then
+		chmod 600 /root/.ssh/authorized_keys
+	fi
+	cp /root/.ssh/authorized_keys ${bkupDir}
+}
+
+sshdConfig () {
+	echo "ACTION: Configuring sshd_config"
+	cp /etc/ssh/sshd_config /root/sshd_config.origional
+	cp ${sshConfig} ${sshConfig}.bak
+
+    # RSAAuthentication
+	sed -i -r -e '/([^(Rhosts)]RSAAuthentication)/I s/[#]*.*[Rr][Ss]/RS/g' ${sshConfig}
+	sed -i -e '/RSAAuthentication/I s//RSAAuthentication/g' ${sshConfig}
+	sed -i -r -e '/^RSAAuthentication/I s/on.*(yes|no).*/on yes/g' ${sshConfig}
+	awk '/RSAAuthentication yes/&&c++>0 {next} 1' ${sshConfig} > ${sshConfig}.swp
+	mv -f ${sshConfig}.swp ${sshConfig}
+
+	# PermitRootLogin
+	sed -i -r -e '/[^"]PermitRootLogin/I s/[#]*.*[Pp][Ee]/Pe/g' ${sshConfig}
+	sed -i -e '/PermitRootLogin/I s//PermitRootLogin/g' ${sshConfig}
+	sed -i -r -e '/PermitRootLogin/I s/in.*(yes|no).*/in yes/g' ${sshConfig}
+	awk '/[^"]*PermitRootLogin [^(without)]/&&c++>0 {next} 1' ${sshConfig} > ${sshConfig}.swp
+	mv -f ${sshConfig}.swp ${sshConfig}
+
+	# Password Authentication
+	sed -i -r -e '/[^(?:but set)]\s*PasswordAuthentication[^,.]/I s/[#]*.*[Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd][Aa]/PasswordA/' ${sshConfig}
+	#sed -i -r -e '/[^(?:but set)]\s*Password\s?Authentication[^,.]/I s/[Dd]\s?[Aa]/dA/g' ${sshConfig}
+	sed -i -e '/^PasswordAuthentication/I s//PasswordAuthentication/g' ${sshConfig}
+	sed -i -r -e '/^PasswordAuthentication/I s/tion.*/tion yes/g' ${sshConfig}
+	awk '/PasswordAuthentication yes/&&c++>0 {next} 1' ${sshConfig} > ${sshConfig}.swp
+	mv -f ${sshConfig}.swp ${sshConfig}
+
+	# PubkeyAuthentication
+	sed -i -r -e '/PubkeyAuthentication/I s/[#]*.*[Pp][Uu]/Pu/g' ${sshConfig}
+	sed -i -e '/PubkeyAuthentication/I s//PubkeyAuthentication2/g' ${sshConfig}
+	sed -i -r -e '/^PubkeyAuthentication/I s/on.*(yes|no).*/on yes/g' ${sshConfig}
+	awk '/PubkeyAuthentication yes/&&c++>0 {next} 1' ${sshConfig} > ${sshConfig}.swp
+	mv -f ${sshConfig}.swp ${sshConfig}
+
+	# GSSAPIAuthentication
+	sed -i -r -e '/GSSAPIAuthentication/I s/[#]*.*[Gg][Ss]/GS/g' ${sshConfig}
+	sed -i -e '/GSSAPIAuthentication/I s//GSSAPIAuthentication/g' ${sshConfig}
+	sed -i -r -e '/^GSSAPIAuthentication/I s/tion.*(yes|no).*/tion yes/' ${sshConfig}
+	awk '/GSSAPIAuthentication yes/&&c++>0 {next} 1' ${sshConfig} > ${sshConfig}.swp
+	mv -f ${sshConfig}.swp ${sshConfig}
+
+	# UseDNS
+	sed -i -r -e '/UseDNS/I s/[#]*.*[Uu][Ss][Ee][Dd]/UseD/g' ${sshConfig}
+	sed -i -e '/UseDNS/I s//UseDNS 1/g' ${sshConfig}
+	sed -i -r -e '/^UseDNS/I s/NS.*/NS no/g' ${sshConfig}
+	awk '/UseDNS no/&&c++>0 {next} 1' ${sshConfig} > ${sshConfig}.swp
+	mv -f ${sshConfig}.swp ${sshConfig}
+
+	cp ${sshConfig}* ${bkupDir}
+
+	# TODO: write if then for this fix. Also, pass output as $3/4 to serviceCheck. Need a check flag to account for inate service check handling.
+	/usr/sbin/sshd -t
+
+	service sshd restart
+
+	# Check and fix if sshd fails to start
+	checkAndRevertService sshd $sshConfig
+}
+
+checkService  () {
+	# When calling this function you need to pass the following:
+	# $1 is service name
+	# $2 is config file variable
+	echo "ACTION: Checking $1 service"
+	if (( $(ps -ef | grep -v grep | grep $1 | wc -l) <= 0 )); then
+		echo "ERROR: $1 is not running. Attempting to start service"
+		service $1 start
+		if [ -z /etc/init.d/$1 ]; then
+			echo "ERROR: $1 is not installed"
+			exit 19
+		else
+			echo "INFO: $1 is installed"
+		fi
+	else
+		echo "INFO: $1 is running"
+	fi
+
+}
+
+
+checkAndRevertService () {
+	# When calling this function you need to pass the following:
+	# $1 is service name
+	# $2 is config file variable
+
+	if (( $(ps -ef | grep -v grep | grep $1 | wc -l) <= 0 )); then
+		echo "ERROR: $1 is not running."
+		echo "ERROR: Human intervention required, reverting $1 config to origional state"
+		cp ${bkupDir}/$2.bak $2
+		service $1 restart
+	else
+		echo "SUCCESS: $1 started!"
+	fi
+}
+
+selinuxConfig () {
+if [[ "$distroID" == "centos" ]] || [[ "$distroID" == "redhat" ]]; then
+	echo "ACTION: Configuring SELINUX"
+	cp /etc/selinux/config /etc/selinux/config.bak
+	sed -i 's/SELINUX=enforcing/SELINUX=permissive/g' /etc/selinux/config
+	cp /etc/selinux/config* ${bkupDir}
+	echo 0 > /selinux/enforce
+fi
+}
+
+dnsFix () {
+if [[ "$distroID" == "centos" ]]; then
+	echo "ACTION: Reconfiguring DNS"
+	cp /etc/resolv.conf /etc/resolv.conf.bak
+	echo "nameserver "${DNS1} > /etc/resolv.conf
+	echo "nameserver "${DNS2} >> /etc/resolv.conf
+	echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+	echo "domain localdomain" >> /etc/resolv.conf
+	cp /etc/resolv.* ${bkupDir}
+fi
+}
+
+forceNetCatUpdate () {
+	if [[ "$distroID" == "centos" ]] || [[ "$distroID" == "redhat" ]]; then
+		echo "ACTION: Forcing netcat update."
+		yum -y update nc
+	fi
+}
+
+initdConfig () {
+	chkconfig $1 on
+	service $1 start
+}
+
+# REMOVED PREMANAGEDGUESTS
+
+
+#-----------------------------------------------------------------------------------------------------------------------
+
+
+###############################
+####         POST          ####
+###############################
+
+
+
+checkIp () {
+	i=$1
+	octets=0
+	while [ ! -z "$i" ]; do
+		octets=`expr $octets + 1`
+		oct=`echo $i |sed -e 's/\..*//'`
+		i=${i#$oct}
+		i=${i#\.}
+		# make sure each octet is numeric and between 0 and 255
+		if ! echo $oct | grep "[0-9][0-9]*" >/dev/null; then
+			return 1
+		fi
+		if [ $oct -gt 255 ]; then
+			return 1
+		fi
+	done
+	# make sure we got 4 octets
+	if [ $octets -ne 4 ]; then
+		return 1
+	fi
+	# all good
+	return 0
+}
+
+eth0IP () {
+	# Obtain IP Address of eth0
+	echo "ACTION: Obtaining IP Address"
+	myIpAddr=`ip addr list eth0 2>/dev/null | egrep "inet.*brd.*eth0" | awk '{print $2}' | awk -F/ '{print $1}'`
+	checkIp ${myIpAddr}
+	if [ $? -ne 0 ]; then
+		echo "ERROR: Problem obtaining IP Address"
+		exit 13
+	fi
+}
+
+verifyRMM () {
+	# Verify that the RMM Server variable is set and that it is a valid IP address (i.e. $rmmServerIp)
+	echo "ACTION: Verifying RMM Server"
+	if [ -z ${rmmServerIp} ]; then
+		echo "ERROR: RMM Server is missing"
+		exit 2
+	else
+		checkIp ${rmmServerIp}
+	if [ $? -ne 0 ]
+		then
+			echo "ERROR: RMM Server does not appear to be a valid IP address"
+			exit 3
+		fi
+	fi
+}
+
+verifyDCSet () {
+	# Verify that the Data Center variable is set (i.e. $dataCenter)
+	echo "ACTION: Verifying Data Center"
+	if [ -z ${dataCenter} ]; then
+		echo "ERROR: Data Center Missing"
+		exit 4
+	fi
+}
+verifyHostNameSet () {
+	# Verify that the New Hostname variable is set (i.e. $newHostname)
+	echo "ACTION: Verifying New Hostname"
+	if [ -z ${newHostname} ]; then
+		echo "ERROR: New Hostname Missing"
+		exit 5
+	fi
+}
+
+verifyDNSSet () {
+	# Verify that the DNS variables are set and are valid IP addresses
+	echo "ACTION: Verifying DNS Servers"
+
+	if [ "x${DNS1}" == "x" ] && [ "x${DNS2}" == "x" ]; then
+		echo "ERROR: No DNS servers provided in configuration file."
+		exit 6
+	fi
+
+	declare -i dnsOneOk=0
+	declare -i dnsTwoOk=0
+
+	checkIp ${DNS1}
+	if [ $? -ne 0 ]; then
+		dnsOneOk=0
+		echo "ERROR: DNS IP ${DNS1} is not valid"
+	else
+		dnsOneOk=1
+	fi
+
+	checkIp ${DNS2}
+	if [ $? -ne 0 ]; then
+		dnsTwoOk=0
+		echo "ERROR: DNS IP ${DNS2} is not valid"
+	else
+		dnsTwoOk=1
+	fi
+
+	if [ ${dnsOneOk} -eq 0 ] && [ ${dnsTwoOk} -eq 0 ]; then
+		echo "ERROR: No valid DNS servers provided."
+		exit 7
+	fi
+}
+
+# REMOVED SETWORKINGDIR
+# REMOVED SETBACKUPDIR
+# REMOVED DISTRODETECT
+# REMOVED SELINUXCONFIG
+
+# Turn off and disable IPTables
+disableIpTables() {
+	echo "ACTION: Stop and disable IPTables"
+	service iptables stop
+	chkconfig iptables off
+}
+
+
+
+# REMOVED CHECKINSTALLED
+
+# moved installPackages next to checkInstalled
+
+cleanPkgMgrCache() {
+    # Clean YUM Repos
+    echo "ACTION: Cleaning YUM Repos"
+	if [[ "$distroID" == "centos" ]] || [[ "$distroID" == "redhat" ]]; then
+		yum clean all &>/dev/null
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		apt-get clean &>/dev/null
+	fi
+}
+
+importVMwarePkgKeys() {
+	# Import VMware Package Keys
+	echo "ACTION: Importing VMware Package Keys"
+	if [[ "$distroID" == "centos" ]]; then
+		rpm --import http://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-DSA-KEY.pub &>/dev/null
+		rpm --import http://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-RSA-KEY.pub &>/dev/null
+	elif [[ "$distroID" == "redhat" ]]; then
+		rpm --import http://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-DSA-KEY.pub &>/dev/null
+		rpm --import http://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-RSA-KEY.pub &>/dev/null
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		wget -q -O - http://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-DSA-KEY.pub 2>/dev/null | apt-key add - &>/dev/null
+		wget -q -O - http://packages.vmware.com/tools/keys/VMWARE-PACKAGING-GPG-RSA-KEY.pub 2>/dev/null | apt-key add - &>/dev/null
+	fi
+}
+
+createVMwareToolsRepo() {
+	# Create VMware Tools Repo
+	echo "ACTION: Creating VMware Tools Repo"
+	if [[ "$distroID" == "centos" ]]; then
+		echo "[vmware-tools]" > /etc/yum.repos.d/vmware-tools.repo
+		echo "name=VMware Tools" >> /etc/yum.repos.d/vmware-tools.repo
+		echo "baseurl=http://packages.vmware.com/tools/esx/latest/rhel${majorVersionID}/${baseArch}" >> /etc/yum.repos.d/vmware-tools.repo
+	    echo "enabled=1" >> /etc/yum.repos.d/vmware-tools.repo
+	    echo "gpgcheck=0" >> /etc/yum.repos.d/vmware-tools.repo
+	elif [[ "$distroID" == "redhat" ]]; then
+		echo "[vmware-tools]" > /etc/yum.repos.d/vmware-tools.repo
+		echo "name=VMware Tools" >> /etc/yum.repos.d/vmware-tools.repo
+		echo "baseurl=http://packages.vmware.com/tools/esx/latest/rhel${majorVersionID}/${baseArch}" >> /etc/yum.repos.d/vmware-tools.repo
+	    echo "enabled=1" >> /etc/yum.repos.d/vmware-tools.repo
+	    echo "gpgcheck=0" >> /etc/yum.repos.d/vmware-tools.repo
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		ubuntuCodename=`lsb_release -c | awk '{print $2}'`
+		echo "deb http://packages.vmware.com/tools/esx/latest/ubuntu ${ubuntuCodename} main" > /etc/apt/sources.list.d/vmware-tools.list
+	fi
+}
+
+removeOldVMwareTools() {
+	# Remove Old VMware Tools
+	echo "ACTION: Removing Old VMware Tools"
+	if [[ "$distroID" == "centos" ]]; then
+		yum -y remove VMwareTools
+	elif [[ "$distroID" == "redhat" ]]; then
+		rpm -e VMwareTools
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		echo "...Ubuntu VMware Tools is not a package"
+	fi
+	if [ -e "/etc/vmware-tools/locations" ]; then
+		rm -rf /etc/vmware-tools/locations
+	fi
+}
+
+installVMwareTools() {
+	# Install VMware Tools
+	echo "ACTION: Installing New VMware Tools (This action may take a few moments)"
+	if [[ "$distroID" == "centos" ]]; then
+		yum -y install vmware-tools-esx-nox vmware-tools-esx-kmods
+	elif [[ "$distroID" == "redhat" ]]; then
+		yum -y install vmware-tools-esx-nox vmware-tools-esx-kmods
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		apt-get update &>/dev/null
+		apt-get --assume-yes install vmware-tools-esx-nox vmware-tools-esx-kmods-`uname -r`
+	fi
+}
+
+verifyVMwareTools() {
+	# Verify VMware Tools Installed
+	echo "ACTION: Verifying VMware Tools Install"
+	if [[ "$distroID" == "centos" ]]; then
+		rpm -q vmware-tools-esx-nox vmware-tools-esx-kmods
+		if [ $? -eq 0 ]; then
+			vmwareToolsVersion=`vmware-toolbox-cmd -v`
+			echo "INFO: VMware Tools Successfully Installed (${vmwareToolsVersion})"
+		else
+			echo "WARNING: Unable to confirm VMware Tools Install.  Manually Verify."
+		fi
+	elif [[ "$distroID" == "redhat" ]]; then
+		rpm -q vmware-tools-esx-nox vmware-tools-esx-kmods
+		if [ $? -eq 0 ]; then
+			vmwareToolsVersion=`vmware-toolbox-cmd -v`
+			echo "INFO: VMware Tools Successfully Installed (${vmwareToolsVersion})"
+		else
+			echo "WARNING: Unable to confirm VMware Tools Install.  Manually Verify."
+		fi
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		dpkg -l vmware-tools-esx-nox vmware-tools-esx-kmods-`uname -r`
+		if [ $? -eq 0 ]; then
+			vmwareToolsVersion=`vmware-toolbox-cmd -v`
+			echo "INFO: VMware Tools Successfully Installed (${vmwareToolsVersion})"
+		else
+			echo "WARNING: Unable to confirm VMware Tools Install.  Manually Verify."
+		fi
+	fi
+}
+
+deleteRoutes() {
+	# Delete static routes
+	echo "ACTION: Removing static routes"
+	if [[ "$distroID" == "centos" ]]; then
+		for routeFile in `ls -1 /etc/sysconfig/network-scripts/route-eth* 2>/dev/null`
+		do
+			echo "ACTION: Configuring routing file: "$routeFile
+			mv ${routeFile} $bkupDir
+		done
+	elif [[ "$distroID" == "redhat" ]]; then
+		for routeFile in `ls -1 /etc/sysconfig/network-scripts/route-eth* 2>/dev/null`
+		do
+			echo "ACTION: Configuring routing file: "$routeFile
+			mv ${routeFile} $bkupDir
+		done
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		cp /etc/network/interfaces /etc/network/interfaces.bak
+		sed -i '/route[[:space:]]*add.*gw/ s/^/#/' /etc/network/interfaces
+		cp /etc/network/interfaces /etc/network/interfaces.bak $bkupDir
+	fi
+}
+
+setHostname() {
+	# Update Hostname
+	echo "ACTION: Updating Hostname"
+	if [[ "$distroID" == "centos" ]]; then
+		cp /etc/sysconfig/network /etc/sysconfig/network.bak
+		cp /etc/hosts /etc/hosts.bak
+		sed -i "s/${myFqdn}/${newHostname}/g" /etc/sysconfig/network
+		sed -i "s/^[0-9].*${myFqdn}.*$/${myIpAddr}\t\t${newHostname}.local\t${newHostname}/" /etc/hosts
+		cp /etc/sysconfig/{network,network.bak} ${bkupDir}
+		cp /etc/hosts* ${bkupDir}
+	elif [[ "$distroID" == "redhat" ]]; then
+		cp /etc/sysconfig/network /etc/sysconfig/network.bak
+		cp /etc/hosts /etc/hosts.bak
+		sed -i "s/${myFqdn}/${newHostname}/g" /etc/sysconfig/network
+		sed -i "s/^[0-9].*${myFqdn}.*$/${myIpAddr}\t\t${newHostname}.local\t${newHostname}/" /etc/hosts
+		cp /etc/sysconfig/{network,network.bak} ${bkupDir}
+		cp /etc/hosts* ${bkupDir}
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		cp /etc/hostname /etc/hostname.bak
+		cp /etc/hosts /etc/hosts.bak
+		sed -i "s/^[0-9].*${myFqdn}.*$/${myIpAddr}\t${newHostname}.local\t${newHostname}/" /etc/hosts
+		echo "${newHostname}.local" > /etc/hostname
+		cp /etc/hostname /etc/hostname.bak ${bkupDir}
+		cp /etc/hosts /etc/hosts.bak ${bkupDir}
+	fi
+}
+
+reconfigureDns() {
+	# Reconfigure DNS
+	echo "ACTION: Reconfiguring DNS"
+	if [[ "$distroID" == "centos" ]]; then
+		cp /etc/resolv.conf /etc/resolv.conf.bak
+		echo "search localdomain" > /etc/resolv.conf
+		if [ "x${DNS1}" != "x" ]; then
+			echo "nameserver ${DNS1}" >> /etc/resolv.conf
+		fi
+		if [ "x${DNS2}" != "x" ]; then
+			echo "nameserver ${DNS2}" >> /etc/resolv.conf
+		fi
+		cp /etc/resolv.* ${bkupDir}
+	elif [[ "$distroID" == "redhat" ]]; then
+		cp /etc/resolv.conf /etc/resolv.conf.bak
+		echo "search localdomain" > /etc/resolv.conf
+		if [ "x${DNS1}" != "x" ]; then
+			echo "nameserver ${DNS1}" >> /etc/resolv.conf
+		fi
+		if [ "x${DNS2}" != "x" ]; then
+			echo "nameserver ${DNS2}" >> /etc/resolv.conf
+		fi
+		cp /etc/resolv.* ${bkupDir}
+	elif [[ "$distroID" == "ubuntu" ]]; then
+		cp /run/resolvconf/resolv.conf ${bkupDir}/resolv.conf.bak
+		newResolvConf=`echo -e "search localdomain\n"`
+		if [ "x${DNS1}" != "x" ]; then
+			newResolvConf=${newResolvConf}`echo -e "\nnameserver ${DNS1}\n"`
+		fi
+		if [ "x${DNS2}" != "x" ]; then
+			newResolvConf=${newResolvConf}`echo -e "\nnameserver ${DNS2}\n"`
+		fi
+		echo "${newResolvConf}" | resolvconf -a eth0.inet
+		cp /run/resolvconf/resolv.conf ${bkupDir}
+	fi
+}
+
+################################
+####     POST MIGRATION     ####
+################################
+
+
+
+deSavvisize () {
+	# Remove Savvis Management Packages
+	echo "ACTION: Removing Savvis Management Packages"
+	svvsPkgs=`rpm -qa | grep svvs`
+	if [ "x${svvsPkgs}" != "x" ]; then
+		rpm -e ${svvsPkgs} &>/dev/null
+	fi
+	# Remove Savvis User Accounts
+	echo "ACTION: Cleaning Up Savvis User Accounts"
+	userdel -r svlogin &>/dev/null
+	userdel -r svvsradm &>/dev/null
+	userdel -r svadmin &>/dev/null
+	# Remove SIA
+	echo "ACTION: Removing SIA"
+	if [ -f /usr/local/monitor/gen_events.cfg ]; then
+		cp /usr/local/monitor/gen_events.cfg ${bkupDir}
+	fi
+	rpm -e sia &>/dev/null
+	# Clean Sudoers
+	echo "ACTION: Cleaning Sudoers"
+	cp /etc/sudoers /etc/sudoers.bak
+	sed -i '/^svadmin.*ALL = NOPASSWD: ALL/d' /etc/sudoers
+	sed -i '/^svvsradm.*ALL = NOPASSWD: ALL/d' /etc/sudoers
+	sed -i '/^C[0-9]*_admin.*ALL.*ALL/d' /etc/sudoers
+	cp /etc/sudoers* ${bkupDir}
+}
+
+clcRHUIInstall () {
+	# Download the RHUI entitlement from the RMM Server
+	if [[ "$distroID" == "redhat" ]]; then
+		echo "ACTION: Determining CLC Data Center"
+		verifyHostNameSet
+		echo "ACTION: Downloading RHUI entitlement files"
+		if [ ! -r ${workingDir}/RHEL_ENT.zip ]; then
+			wget -qP ${workingDir} --no-check-certificate https://${rmmServerIp}/${rmmWebDir}/RHEL_ENT.zip 2>/dev/null
+			if [ $? -eq 0 ]; then
+				echo "INFO: Successfully downloaded RHUI entitlement files"
+			else
+				echo "ERROR: Failed to download RHUI entitlement files"
+			fi
+		fi
+		# Remove VPDC RHUI rpms before installing the CLC RHUI
+		echo "ACTION: Removing conflicting VPDC RHUI rpm"
+		vpdcOldRhuiRpmName="svvs-rhua-dc2-rhel${majorVersionID}"
+		if rpm -q --quiet ${vpdcOldRhuiRpmName}; then
+			rpm -e ${vpdcOldRhuiRpmName}
+			if [ $? -eq 0 ]; then
+				printf "%-68s %10s\n" "Removing ${vpdcOldRhuiRpm}:" "[ OK ]"
+			else
+				printf "%-68s %10s\n" "Removing ${vpdcOldRhuiRpm}:" "[ FAILED ]"
+			fi
+		fi
+
+		# Install RHUI entitlement and disable RHN plugin
+		echo "ACTION: Install RHUI entitlement and disable RHN plugin"
+		cd ${workingDir}
+		unzip -qo RHEL_ENT.zip 2>/dev/null
+		if [ $? -eq 0 ]; then
+			echo "INFO: Successfully extracted RHUI entitlement"
+		else
+			echo "ERROR: Failed to extract RHUI entitlement"
+		fi
+
+		if [ -f ${workingDir}RHEL_ENT/RHEL${majorVersionID}-${dataCenter}T3N-Client-Ent-2.0-1.noarch.rpm ]; then
+			rpm -i ${workingDir}RHEL_ENT/RHEL${majorVersionID}-${dataCenter}T3N-Client-Ent-2.0-1.noarch.rpm
+			if [ $? -eq 0 ]; then
+				echo "INFO: Successfully installed RHUI entitlement"
+			else
+				echo "ERROR: Failed to install RHUI entitlement"
+			fi
+			cp ${workingDir}RHEL_ENT/RHEL${majorVersionID}-${dataCenter}T3N-Client-Ent-2.0-1.noarch.rpm ${sysAdminDir}
+		else
+			echo "ERROR: RHUI entitlement RPM ${workingDir}RHEL_ENT/RHEL${majorVersionID}-${dataCenter}T3N-Client-Ent-2.0-1.noarch.rpm does not exist."
+			exit 7
+		fi
+	fi
+}
+
+vpdcRHUIFix () {
+	if [[ "$distroID" == "redhat" ]]; then
+		echo "ACTION: Fixing VPDC RHUI expired SSL issue"
+
+		if [ -f ${rhRepoFile} ]; then
+			rpm -e ${oldRhuiRpm} &>/dev/null
+			if [ $? -eq 0 ]; then
+				printf "%-68s %10s\n" "Removing ${oldRhuiRpm}:" "[ OK ]"
+			else
+				printf "%-68s %10s\n" "Removing ${oldRhuiRpm}:" "[ FAILED ]"
+				exit 1
+			fi
+		fi
+
+		if [ -f ${rpmDir}/${vpdcOldRhuiRpm} ]; then
+			rpm -i ${rpmDir}/${vpdcOldRhuiRpm} &>/dev/null
+			if [ $? -eq 0 ]; then
+				printf "%-68s %10s\n" "Installing ${vpdcOldRhuiRpm}:" "[ OK ]"
+			else
+				printf "%-68s %10s\n" "Installing ${vpdcOldRhuiRpm}:" "[ FAILED ]"
+				exit 8
+			fi
+		else
+			echo "ERROR: Script is unable to find RPM ${rpmDir}/${vpdcOldRhuiRpm}.  Install manually."
+			exit 7
+		fi
+	fi
+}
+
+opswareUninstall () {
+	# Remove Opsware (silent install --force, for windows it is FORCE="1")
+	echo "ACTION: Uninstalling HPSA Agent"
+	if [ -f /opt/opsware/agent/bin/agent_uninstall.sh ]; then
+		ps -ef | grep opsware | grep -v grep | awk '{print $2}' | xargs kill -9
+		cp /etc/opt/opsware/agent/opswgw.args ${bkupDir}/opswgw.args.bak
+		echo 'opswgw.gw_list: 127.0.0.1:3001,127.0.0.1:3001' > /etc/opt/opsware/agent/opswgw.args
+		/opt/opsware/agent/bin/agent_uninstall.sh --force &>/dev/null
+		rm -rf /var/opt/opsware &>/dev/null
+		hpsaUninstalled=true
+	else
+		echo "INFO: File /opt/opsware/agent/bin/agent_uninstall.sh does not exist.  Skipping HPSA Agent Uninstall."
+		hpsaUninstalled=false
+	fi
+
+	if [ ${hpsaUninstalled} ]; then
+		# Verify Opsware Uninstall
+		declare -i hpsaOptCheck=`find /opt/opsware/agent -maxdepth 0 -type d &>/dev/null ; echo $?`
+		declare -i hpsaEtcCheck=`find /etc/opt/opsware -maxdepth 0 -type d &>/dev/null ; echo $?`
+		declare -i hpsaVarCheck=`find /var/opt/opsware -maxdepth 0 -type d &>/dev/null ; echo $?`
+		declare -i hpsaInitCheck=`ls /etc/init.d/opsware-agent &>/dev/null ; echo $?`
+
+		if [ ${hpsaOptCheck} -eq 0 ] || [ ${hpsaEtcCheck} -eq 0 ] || [ ${hpsaVarCheck} -eq 0 ] || [ ${hpsaInitCheck} -eq 0 ]; then
+			echo "WARNING: Unable to confirm HPSA Agent Removal.  Manually Verify."
+		else
+			echo "INFO: HPSA Agent Successfully Removed"
+		fi
+	fi
+}
+
+snmpdConfig () {
+# Replace SNMPD Configuration
+	echo "ACTION: Replacing SNMPD Configuration"
+	cp /etc/snmp/snmpd.conf /etc/snmp/snmpd.conf.bak
+	echo "com2sec	notConfigUser	default	tier3-snmp" > /etc/snmp/snmpd.conf
+	echo "view	systemview	included	.1	.80" >> /etc/snmp/snmpd.conf
+	cp /etc/snmp/snmpd.* ${bkupDir}
+}
+
+getSysAdminZip () {
+	# Get the Linuxsysprep.zip from the RMM Server
+	echo "ACTION: Downloading Sysadmin files"
+	wget -qP ${workingDir} --no-check-certificate https://${rmmServerIp}/${rmmWebDir}/Linuxsysprep.zip 2>/dev/null
+	if [ $? -eq 0 ]; then
+		echo "INFO: Successfully downloaded Sysadmin files"
+	else
+		echo "ERROR: Failed to download Sysadmin files"
+	fi
+
+	# Create the /sysadmin directory and extract the Sysadmin files in the newly created directory.
+	echo "ACTION: Setting up Sysadmin directory and files"
+	if [ ! -d ${sysAdminDir} ]; then
+		mkdir -m 755 ${sysAdminDir}
+	fi
+	cd ${sysAdminDir}
+	unzip -qo ${workingDir}Linuxsysprep.zip 2>/dev/null
+	if [ $? -eq 0 ]; then
+		echo "INFO: Successfully extracted Sysadmin files"
+	else
+		echo "ERROR: Failed to extract Sysadmin files"
+	fi
+	find ${sysAdminDir} -type f -name \*.sh -exec chmod 555 {} \;
+}
+
+leaveADDomain () {
+	if [ "$distroID" == "centos" ] || [ "$distroID" == "redhat" ]; then
+		adleave -rf
+	fi
+}
+
+
+
+clcPrepUb () {
+	# Ubuntu Stuff goes here!
+	echo "WARNING: Ubuntu Functions must be completed manually!"
+	exit 15
+}
+
+rebootInstance () {
+	echo "[R]eboot the server or [E]xit:  [r|e] "
+	read -r response
+	response=`echo ${response}|tr '[:upper:]' '[:lower:]'|cut -b 1`
+	case $response in
+		y)
+			echo "ACTION: Rebooting"
+			reboot
+			;;
+		e)
+			echo "Action: Exiting Script"
+			exit 0
+			;;
+		*)
+			echo "ERROR: Incoherent user entry"
+			echo ""
+			rebootInstance
+			;;
+	esac
+}
+
